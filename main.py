@@ -20,6 +20,28 @@ app.add_middleware(
 
 VISION_API_KEY = os.environ.get("GOOGLE_VISION_API_KEY")
 
+# Generic labels to ignore — not real brands
+GENERIC_LABELS = {
+    "bottled and jarred packaged goods", "food", "drink", "beverage",
+    "product", "bottle", "can", "package", "container", "box",
+    "label", "plastic", "glass", "liquid", "snack", "ingredient",
+    "cuisine", "dish", "meal", "fruit", "vegetable", "tableware",
+    "drinkware", "soft drink", "alcoholic beverage", "dairy product",
+    "fast food", "junk food", "convenience food", "processed food",
+    "tin", "jar", "bag", "wrapper", "carton", "tube"
+}
+
+# Known brand keywords to look for in text detection
+BRAND_KEYWORDS = [
+    "nike", "adidas", "apple", "google", "amazon", "coca-cola", "pepsi",
+    "jamieson", "trader joe", "tic tac", "nestle", "kraft", "heinz",
+    "samsung", "sony", "microsoft", "starbucks", "mcdonalds", "subway",
+    "lululemon", "under armour", "puma", "reebok", "new balance",
+    "loreal", "maybelline", "revlon", "dove", "tide", "bounty",
+    "colgate", "listerine", "advil", "tylenol", "celsius", "red bull",
+    "monster", "gatorade", "vitamin water", "fiji", "evian", "dasani",
+]
+
 class AnalyzeRequest(BaseModel):
     video_url: str
     scan_id: str
@@ -27,6 +49,52 @@ class AnalyzeRequest(BaseModel):
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+def is_likely_brand(text: str) -> bool:
+    """Check if text is likely a brand name vs generic label."""
+    lower = text.lower().strip()
+    if lower in GENERIC_LABELS:
+        return False
+    # Filter out very short or very long strings
+    if len(lower) < 2 or len(lower) > 40:
+        return False
+    # Filter out strings that are just numbers
+    if lower.replace(" ", "").isdigit():
+        return False
+    # Filter out common non-brand words
+    non_brands = {
+        "the", "and", "for", "with", "from", "this", "that", "are",
+        "was", "has", "have", "been", "will", "can", "may", "new",
+        "old", "big", "small", "best", "good", "great", "natural",
+        "organic", "original", "classic", "premium", "quality", "fresh"
+    }
+    if lower in non_brands:
+        return False
+    return True
+
+def extract_brands_from_text(text_annotations: list) -> list:
+    """Extract likely brand names from text detection results."""
+    if not text_annotations:
+        return []
+    
+    # First annotation is the full text block
+    full_text = text_annotations[0].get("description", "").lower() if text_annotations else ""
+    
+    found_brands = []
+    for keyword in BRAND_KEYWORDS:
+        if keyword in full_text:
+            # Find the properly cased version
+            for word in text_annotations[1:]:
+                desc = word.get("description", "")
+                if desc.lower() == keyword or keyword in desc.lower():
+                    if desc not in found_brands and len(desc) > 2:
+                        found_brands.append(desc)
+                        break
+            else:
+                # Use the keyword itself capitalized
+                found_brands.append(keyword.title())
+    
+    return found_brands
 
 @app.post("/analyze")
 async def analyze_video(request: AnalyzeRequest):
@@ -43,7 +111,7 @@ async def analyze_video(request: AnalyzeRequest):
             with open(video_path, "wb") as f:
                 f.write(response.content)
 
-        # 2. Extract frames with FFmpeg (1 frame every 5 seconds, max 10 frames)
+        # 2. Extract frames with FFmpeg
         subprocess.run([
             "ffmpeg", "-i", video_path,
             "-vf", "fps=1/5",
@@ -54,7 +122,7 @@ async def analyze_video(request: AnalyzeRequest):
 
         # 3. Read extracted frames
         frame_files = sorted([
-            f for f in os.listdir(frames_dir) 
+            f for f in os.listdir(frames_dir)
             if f.endswith(".jpg")
         ])
 
@@ -67,14 +135,15 @@ async def analyze_video(request: AnalyzeRequest):
             with open(f"{frames_dir}/{frame_file}", "rb") as f:
                 frames_base64.append(base64.b64encode(f.read()).decode())
 
-        # 5. Call Google Vision API
+        # 5. Call Google Vision API with TEXT_DETECTION added
         requests_payload = [
             {
                 "image": {"content": frame},
                 "features": [
                     {"type": "LOGO_DETECTION", "maxResults": 10},
                     {"type": "OBJECT_LOCALIZATION", "maxResults": 10},
-                    {"type": "LABEL_DETECTION", "maxResults": 10}
+                    {"type": "LABEL_DETECTION", "maxResults": 10},
+                    {"type": "TEXT_DETECTION", "maxResults": 10}
                 ]
             }
             for frame in frames_base64
@@ -95,7 +164,7 @@ async def analyze_video(request: AnalyzeRequest):
             if frame_result.get("error"):
                 continue
 
-            # Logos
+            # Logos (highest confidence — always include)
             for logo in frame_result.get("logoAnnotations", []):
                 name = logo["description"]
                 if name not in brand_map:
@@ -103,23 +172,44 @@ async def analyze_video(request: AnalyzeRequest):
                         "name": name,
                         "frame_count": 0,
                         "total_confidence": 0,
-                        "prominence": "Low"
+                        "prominence": "Low",
+                        "source": "logo"
                     }
                 brand_map[name]["frame_count"] += 1
                 brand_map[name]["total_confidence"] += logo.get("score", 0.8) * 100
                 brand_map[name]["prominence"] = "High"
 
-            # Objects
+            # Text detection — extract brand names from OCR
+            text_annotations = frame_result.get("textAnnotations", [])
+            text_brands = extract_brands_from_text(text_annotations)
+            for brand_name in text_brands:
+                if brand_name not in brand_map:
+                    brand_map[brand_name] = {
+                        "name": brand_name,
+                        "frame_count": 0,
+                        "total_confidence": 0,
+                        "prominence": "Medium",
+                        "source": "text"
+                    }
+                brand_map[brand_name]["frame_count"] += 1
+                brand_map[brand_name]["total_confidence"] += 75
+                if brand_map[brand_name]["prominence"] == "Low":
+                    brand_map[brand_name]["prominence"] = "Medium"
+
+            # Objects — only include if they pass brand filter
             for obj in frame_result.get("localizedObjectAnnotations", []):
                 if obj.get("score", 0) < 0.6:
                     continue
                 name = obj["name"]
+                if not is_likely_brand(name):
+                    continue
                 if name not in brand_map:
                     brand_map[name] = {
                         "name": name,
                         "frame_count": 0,
                         "total_confidence": 0,
-                        "prominence": "Low"
+                        "prominence": "Low",
+                        "source": "object"
                     }
                 brand_map[name]["frame_count"] += 1
                 brand_map[name]["total_confidence"] += obj.get("score", 0.6) * 100
@@ -134,7 +224,7 @@ async def analyze_video(request: AnalyzeRequest):
                     elif area > 0.08 and brand_map[name]["prominence"] == "Low":
                         brand_map[name]["prominence"] = "Medium"
 
-        # 7. Build brands array
+        # 7. Build brands array — filter out generics
         brands = [
             {
                 "name": b["name"],
@@ -148,6 +238,7 @@ async def analyze_video(request: AnalyzeRequest):
                 "score": min(round(b["total_confidence"] / b["frame_count"]), 100)
             }
             for b in brand_map.values()
+            if is_likely_brand(b["name"])
         ]
 
         # 8. Calculate overall score
@@ -157,21 +248,22 @@ async def analyze_video(request: AnalyzeRequest):
                 (10 if any(b["prominence"] == "High" for b in brands) else 0)
             ), 100)
         else:
-            overall_score = 45
+            # No real brands detected — low score
+            overall_score = 30
 
         # 9. Recommendations
         recommendations = []
-        if not any(b["prominence"] == "High" for b in brands):
+        if not brands:
+            recommendations.append(
+                "No brands detected — ensure product logo is clearly visible on camera"
+            )
+        if brands and not any(b["prominence"] == "High" for b in brands):
             recommendations.append(
                 "Request center-frame placement for higher prominence scores"
             )
-        if any(b["context"] == "Brief appearance" for b in brands):
+        if brands and any(b["context"] == "Brief appearance" for b in brands):
             recommendations.append(
                 "Increase screen time — brief appearances score significantly lower"
-            )
-        if not brands:
-            recommendations.append(
-                "No brands detected — ensure product/logo is clearly visible on camera"
             )
         recommendations.append(
             "Aim for placement in first 5 minutes when viewer retention is highest"
